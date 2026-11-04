@@ -66,6 +66,16 @@
           "ithyper.ru"
         ],
         "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "openai.com",
+          "chatgpt.com",
+          "oaistatic.com",
+          "oaiusercontent.com",
+          "oaistatsig.com"
+        ],
+        "outbound": "proxy"
       }
     ],
     "final": "direct"
