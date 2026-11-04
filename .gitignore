@@ -1,0 +1,7 @@
+env
+.env
+*.bak*
+nodes_cache.txt
+.alert_ts
+*.key
+*.pem
