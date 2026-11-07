@@ -5,6 +5,8 @@ CACHE=/opt/vless-updater/nodes_cache.txt
 ALERT_TS=/opt/vless-updater/.alert_ts
 STATE=/opt/vless-updater/.state
 ALERT_COOLDOWN=14400   # 4 часа, только для предупреждений
+XCONFIG=${XCONFIG:-/usr/local/etc/xray/config.json}
+BUILDER=/opt/vless-updater/build_xray_config.py
 
 log() { echo "[vless-updater] $1"; }
 
@@ -61,7 +63,7 @@ fetch_nodes() {
 code=$(health)
 if [ "$code" = "200" ]; then
   if [ "$(state)" = "fail" ]; then
-    cur=$(grep -oP '(?<="server": ")[^"]+' "$CONFIG" | head -1)
+    cur=$(grep -oP '(?<="address": ")[^"]+' "$XCONFIG" | head -1)
     notify "✅ VPN VPS: прокси восстановлен (нода $cur), OpenRouter 200"
   fi
   mark ok
@@ -84,30 +86,33 @@ else
   exit 1
 fi
 
-sorted=$(mktemp)
-grep "АВТОВЫБОР" "$tmpfile" > "$sorted" 2>/dev/null
-grep -v "АВТОВЫБОР" "$tmpfile" >> "$sorted" 2>/dev/null
-
-one=$(mktemp)
+n=$(grep -c '^vless://' "$tmpfile")
+i=0
 fixed=""
-tried=0
-while IFS= read -r link; do
-  [[ "$link" == vless://* ]] || continue
-  tried=$((tried+1))
-  printf '%s\n' "$link" > "$one"
-  res=$(python3 /opt/vless-updater/apply_node.py "$CONFIG" "$one")
-  log "node $tried: $res"
-  case "$res" in
-    UPDATED:*|SAME_CONFIG:*) ;;
-    *) continue ;;
-  esac
-  systemctl restart sing-box
+while [ $i -lt "$n" ]; do
+  i=$((i+1))
+  onecfg=$(mktemp --suffix=.json)
+  res=$(python3 "$BUILDER" "$tmpfile" "$onecfg" "$i" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    log "node $i: skip ($res)"
+    rm -f "$onecfg"
+    continue
+  fi
+  if ! xray run -test -c "$onecfg" >/dev/null 2>&1; then
+    log "node $i: xray -test failed"
+    rm -f "$onecfg"
+    continue
+  fi
+  cp "$onecfg" "$XCONFIG"
+  rm -f "$onecfg"
+  systemctl restart xray
   sleep 3
   c1=$(health); [ "$c1" = "200" ] || { sleep 5; c1=$(health); }
-  log "node $tried: health $c1"
-  if [ "$c1" = "200" ]; then fixed="${res#*:}"; break; fi
-done < "$sorted"
-rm -f "$one" "$tmpfile" "$sorted"
+  log "node $i: ${res#BUILT:} health $c1"
+  if [ "$c1" = "200" ]; then fixed="${res#BUILT:}"; break; fi
+done
+rm -f "$tmpfile"
 
 if [ -n "$fixed" ]; then
   log "config updated, healthy on $fixed"
@@ -116,9 +121,9 @@ if [ -n "$fixed" ]; then
   exit 0
 fi
 
-log "ERROR: все $tried нод(ы) не прошли проверку"
+log "ERROR: все $n кандидат(ов) не прошли проверку"
 if [ "$(state)" != "fail" ]; then
-  notify "❌ VPN VPS: все ноды из подписки недоступны (reality/auth) — ручной разбор или сбой ithyper"
+  notify "❌ VPN VPS: все ноды из подписки недоступны — ручной разбор или сбой ithyper"
 fi
 mark fail
 exit 1
