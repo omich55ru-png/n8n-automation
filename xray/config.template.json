@@ -1,0 +1,25 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "tag": "socks-in", "listen": "172.19.0.1", "port": 1080,
+      "protocol": "socks", "settings": { "udp": false } },
+    { "tag": "http-in", "listen": "172.19.0.1", "port": 1081,
+      "protocol": "http" }
+  ],
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "proxy", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "NODE_HOST", "port": 443,
+        "users": [ { "id": "YOUR_UUID", "encryption": "none" } ] } ] },
+      "streamSettings": { "network": "xhttp", "security": "tls",
+        "tlsSettings": { "serverName": "NODE_HOST", "fingerprint": "firefox",
+          "alpn": ["h2", "http/1.1"] },
+        "xhttpSettings": { "path": "XHTTP_PATH", "host": "NODE_HOST", "mode": "auto" } } }
+  ],
+  "routing": { "domainStrategy": "AsIs", "rules": [
+    { "type": "field", "domain": ["domain:openrouter.ai", "domain:claude.ai", "domain:anthropic.com"], "outboundTag": "proxy" },
+    { "type": "field", "domain": ["domain:telegram.org", "domain:t.me", "domain:telesco.pe"], "outboundTag": "proxy" },
+    { "type": "field", "domain": ["domain:ithyper.ru"], "outboundTag": "proxy" },
+    { "type": "field", "domain": ["domain:openai.com", "domain:chatgpt.com", "domain:oaistatic.com", "domain:oaiusercontent.com", "domain:oaistatsig.com"], "outboundTag": "proxy" }
+  ] }
+}
