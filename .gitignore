@@ -5,3 +5,4 @@ nodes_cache.txt
 .alert_ts
 *.key
 *.pem
+.state

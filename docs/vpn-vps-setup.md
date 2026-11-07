@@ -11,7 +11,7 @@ n8n (Docker) → http://172.19.0.1:1081 (sing-box) → VLESS/Reality → нод�
 |---|---|---|
 | openrouter.ai, claude.ai, anthropic.com | proxy | LLM API (напрямую 403) |
 | telegram.org, t.me, telesco.pe | proxy | Telegram |
-| ithyper.ru | proxy | Скачивание подписки: панель sub.ithyper.ru зависает для прямого трафика с VPS |
+| ithyper.ru | proxy | Скачивание подписки: панель периодически не отвечает прямому трафику с VPS |
 | openai.com, chatgpt.com, oaistatic.com, oaiusercontent.com, oaistatsig.com | proxy | ChatGPT и OpenAI API (добавлено 04.11.2026) |
 
 Правило ithyper.ru добавлено 02.11.2026, правило OpenAI/ChatGPT добавлено 04.11.2026. Остальное идёт напрямую (final: direct).
@@ -19,13 +19,13 @@ n8n (Docker) → http://172.19.0.1:1081 (sing-box) → VLESS/Reality → нод�
 Шаблон конфига: sing-box/config.template.json.
 
 ## Автообновление ноды (/opt/vless-updater)
-1. health: GET openrouter.ai через прокси; 200 → выход.
-2. Подписка скачивается через прокси (curl -x "$PROXY").
-3. Успех → копия в nodes_cache.txt. Сбой → берётся кэш; кэша нет → алерт.
-4. apply_node.py выбирает живую ноду (АВТОВЫБОР первым) и правит только поля vless-outbound.
-5. Рестарт sing-box, повторная проверка, уведомление в Telegram.
+1. health: GET openrouter.ai через прокси; 200 → выход (при переходе fail→ok шлёт ✅ восстановления).
+2. Подписка: через прокси, при сбое — напрямую (иначе порочный круг: при мёртвом туннеле ключи не скачать). Успех → nodes_cache.txt; сбой → кэш; нет кэша → ⚠️.
+3. Перебор нод с проверкой auth (АВТОВЫБОР первым): применить → restart sing-box → health; 000 → следующая. TCP жив ≠ Reality валиден (инцидент 07.11).
+4. Все ноды мертвы → ❌ (один раз, пока состояние fail).
 
-Антиспам: не чаще 1 алерта в 4 часа (метка времени в .alert_ts).
+Уведомления: ❌/✅ — всегда (по смене состояния, файл .state); троттлится только ⚠️ (не чаще 1 в 4 часа, .alert_ts).
+TimeoutStartSec=600 (override /etc/systemd/system/vless-updater.service.d/timeout.conf): перебор нод может занимать минуты.
 Секреты (TG_TOKEN, SUB_URL, PROXY) — в /opt/vless-updater/env, в git не попадают.
 
 ## Инциденты
@@ -34,6 +34,7 @@ n8n (Docker) → http://172.19.0.1:1081 (sing-box) → VLESS/Reality → нод�
 | 22.09 | reality verification failed на всех нодах | Провайдер сменил UUID | Обновить uuid из подписки |
 | 29.09 | Пропало telegram-правило | Конфиг пересоздан setup-скриптом | Правила хранятся в шаблоне sing-box/ |
 | 02.11 | Апдейтер получал 000 от панели | Подписка качалась напрямую, панель вешает ответ | Правило ithyper.ru + curl -x + кэш нод |
+| 07.11 | reality verification failed, openrouter/telegram 000 | node3 мертва на стороне провайдера: TCP жив, Reality нет; АВТОВЫБОР указывал на неё. Плюс: подписка качалась только через мёртвый прокси, ❌-алерт съеден антиспамом | Переход на node2 вручную; update.sh v2: перебор нод с auth-check, фолбэк скачивания напрямую, алерты по смене состояния |
 
 ## Чек-лист после переустановки
 1. Взять sing-box/config.template.json, подставить NODE_HOST, YOUR_UUID, NODE_PUBLIC_KEY, NODE_SHORT_ID.
