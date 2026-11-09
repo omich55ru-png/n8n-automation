@@ -1,17 +1,21 @@
 #!/bin/bash
+# v3.1 — retry-цикл на случай общего флапа ithyper (08.11.2026: все 4 ноды лежали ~20 мин)
 source /opt/vless-updater/env
 
 CACHE=/opt/vless-updater/nodes_cache.txt
 ALERT_TS=/opt/vless-updater/.alert_ts
 STATE=/opt/vless-updater/.state
-ALERT_COOLDOWN=14400   # 4 часа, только для предупреждений
+ALERT_COOLDOWN=14400
 XCONFIG=${XCONFIG:-/usr/local/etc/xray/config.json}
 BUILDER=/opt/vless-updater/build_xray_config.py
+ATTEMPTS=${ATTEMPTS:-4}
+RETRY_DELAY=${RETRY_DELAY:-180}
 
 log() { echo "[vless-updater] $1"; }
 
 notify() {
   [ -z "$TG_TOKEN" ] && return
+  log "alert send: ${1:0:60}"
   curl -s --max-time 20 -x "$PROXY" \
     "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
     -d "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" >/dev/null 2>&1 \
@@ -60,59 +64,78 @@ fetch_nodes() {
   return 1
 }
 
+recovered() {
+  cur=$(grep -oP '(?<="address": ")[^"]+' "$XCONFIG" | head -1)
+  notify "✅ VPN VPS: прокси восстановлен (нода $cur), OpenRouter 200"
+  mark ok
+}
+
 code=$(health)
 if [ "$code" = "200" ]; then
-  if [ "$(state)" = "fail" ]; then
-    cur=$(grep -oP '(?<="address": ")[^"]+' "$XCONFIG" | head -1)
-    notify "✅ VPN VPS: прокси восстановлен (нода $cur), OpenRouter 200"
-  fi
+  [ "$(state)" = "fail" ] && recovered
   mark ok
   log "healthy (HTTP 200), nothing to do"
   exit 0
 fi
-log "unhealthy (HTTP $code), fetching subscription..."
+log "unhealthy (HTTP $code), starting heal attempts..."
 
-tmpfile=$(mktemp)
-if fetch_nodes "$tmpfile"; then
-  cp "$tmpfile" "$CACHE"
-  log "nodes: $(grep -c '^vless://' "$tmpfile") from subscription"
-elif grep -q "^vless://" "$CACHE" 2>/dev/null; then
-  log "fetch failed, using nodes cache ($(grep -c '^vless://' "$CACHE") nodes)"
-  cp "$CACHE" "$tmpfile"
-else
-  log "ERROR: subscription fetch failed and no cache"
-  notify_rate "⚠️ VPN VPS: не удалось скачать подписку ithyper (кэша нет)"
-  rm -f "$tmpfile"
-  exit 1
-fi
-
-n=$(grep -c '^vless://' "$tmpfile")
-i=0
 fixed=""
-while [ $i -lt "$n" ]; do
-  i=$((i+1))
-  onecfg=$(mktemp --suffix=.json)
-  res=$(python3 "$BUILDER" "$tmpfile" "$onecfg" "$i" 2>&1)
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    log "node $i: skip ($res)"
-    rm -f "$onecfg"
+for attempt in $(seq 1 "$ATTEMPTS"); do
+  if [ "$attempt" -gt 1 ]; then
+    log "attempt $attempt/$ATTEMPTS: пауза ${RETRY_DELAY}s, затем ре-проверка"
+    sleep "$RETRY_DELAY"
+    code=$(health)
+    if [ "$code" = "200" ]; then
+      log "self-recovered during retry window"
+      recovered
+      log "healthy (HTTP 200) after wait"
+      exit 0
+    fi
+  fi
+
+  tmpfile=$(mktemp)
+  if fetch_nodes "$tmpfile"; then
+    cp "$tmpfile" "$CACHE"
+    log "attempt $attempt: nodes: $(grep -c '^vless://' "$tmpfile") from subscription"
+  elif grep -q "^vless://" "$CACHE" 2>/dev/null; then
+    log "attempt $attempt: fetch failed, using cache ($(grep -c '^vless://' "$CACHE") nodes)"
+    cp "$CACHE" "$tmpfile"
+  else
+    log "attempt $attempt: ERROR subscription fetch failed and no cache"
+    notify_rate "⚠️ VPN VPS: не удалось скачать подписку ithyper (кэша нет)"
+    rm -f "$tmpfile"
     continue
   fi
-  if ! xray run -test -c "$onecfg" >/dev/null 2>&1; then
-    log "node $i: xray -test failed"
+
+  n=$(grep -c '^vless://' "$tmpfile")
+  i=0
+  while [ $i -lt "$n" ]; do
+    i=$((i+1))
+    onecfg=$(mktemp --suffix=.json)
+    res=$(python3 "$BUILDER" "$tmpfile" "$onecfg" "$i" 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      log "attempt $attempt node $i: skip ($res)"
+      rm -f "$onecfg"
+      continue
+    fi
+    if ! xray run -test -c "$onecfg" >/dev/null 2>&1; then
+      log "attempt $attempt node $i: xray -test failed"
+      rm -f "$onecfg"
+      continue
+    fi
+    cp "$onecfg" "$XCONFIG"
     rm -f "$onecfg"
-    continue
-  fi
-  cp "$onecfg" "$XCONFIG"
-  rm -f "$onecfg"
-  systemctl restart xray
-  sleep 3
-  c1=$(health); [ "$c1" = "200" ] || { sleep 5; c1=$(health); }
-  log "node $i: ${res#BUILT:} health $c1"
-  if [ "$c1" = "200" ]; then fixed="${res#BUILT:}"; break; fi
+    systemctl restart xray
+    sleep 3
+    c1=$(health); [ "$c1" = "200" ] || { sleep 5; c1=$(health); }
+    disp="${res#BUILT:}"; disp="${disp% extra=yes}"
+    log "attempt $attempt node $i: $disp health $c1"
+    if [ "$c1" = "200" ]; then fixed="$disp"; break; fi
+  done
+  rm -f "$tmpfile"
+  [ -n "$fixed" ] && break
 done
-rm -f "$tmpfile"
 
 if [ -n "$fixed" ]; then
   log "config updated, healthy on $fixed"
@@ -121,9 +144,9 @@ if [ -n "$fixed" ]; then
   exit 0
 fi
 
-log "ERROR: все $n кандидат(ов) не прошли проверку"
+log "ERROR: все кандидаты мертвы после $ATTEMPTS попыток"
 if [ "$(state)" != "fail" ]; then
-  notify "❌ VPN VPS: все ноды из подписки недоступны — ручной разбор или сбой ithyper"
+  notify "❌ VPN VPS: все ноды недоступны ($ATTEMPTS попытки за ~$(( (ATTEMPTS-1)*RETRY_DELAY/60 + 10 )) мин) — похоже на общий сбой ithyper. Повтор через час по таймеру."
 fi
 mark fail
 exit 1
