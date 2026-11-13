@@ -1,71 +1,99 @@
 #!/usr/bin/env python3
-import sys, json, urllib.parse
+"""Build only the proxy outbound; never print subscription values."""
+import argparse
+import base64
+import json
+import re
+import sys
+import uuid
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
-cache_path, out_path = sys.argv[1], sys.argv[2]
-want = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
-drop_extra = "--no-extra" in sys.argv
 
-links = []
-for line in open(cache_path):
-    line = line.strip()
-    if not line.startswith("vless://"):
-        continue
-    rest = line[len("vless://"):]
-    uuid, rest = rest.split("@", 1)
-    sp, params = rest.split("?", 1)
-    server, port = sp.rsplit(":", 1)
-    q = dict(urllib.parse.parse_qsl(params.split("#")[0]))
-    name = urllib.parse.unquote(line.rsplit("#", 1)[-1]) if "#" in line else server
-    links.append({"server": server, "port": int(port), "uuid": uuid, "q": q, "name": name})
+def build(line, cfg, drop_extra=False):
+    u = urlsplit(line)
+    q = parse_qs(u.query, keep_blank_values=True)
+    get = lambda key: q.get(key, [""])[0]
+    if not u.hostname or not u.port or not u.username:
+        raise ValueError("missing_endpoint")
+    uid = str(uuid.UUID(unquote(u.username)))
+    if not get("sni"):
+        raise ValueError("missing_sni")
+    user = {"id": uid, "encryption": "none"}
+    kind = (get("type"), get("security"))
+    if kind == ("xhttp", "tls"):
+        tls = {"serverName": get("sni"), "fingerprint": get("fp") or "firefox"}
+        if get("alpn"):
+            tls["alpn"] = [v for v in get("alpn").split(",") if v]
+        xs = {"path": get("path") or "/", "mode": get("mode") or "auto"}
+        if get("host"):
+            xs["host"] = get("host")
+        if get("extra") and not drop_extra:
+            xs["extra"] = json.loads(get("extra"))
+            if not isinstance(xs["extra"], dict):
+                raise ValueError("invalid_extra")
+        stream = {"network": "xhttp", "security": "tls", "tlsSettings": tls, "xhttpSettings": xs}
+        label = "xhttp_tls"
+    elif kind in (("tcp", "reality"), ("raw", "reality")):
+        key = get("pbk")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", key):
+            raise ValueError("invalid_public_key")
+        if len(base64.urlsafe_b64decode(key + "=")) != 32:
+            raise ValueError("invalid_public_key")
+        sid = get("sid")
+        if len(sid) > 16 or len(sid) % 2 or not re.fullmatch(r"[0-9a-fA-F]*", sid):
+            raise ValueError("invalid_short_id")
+        if get("flow") not in ("", "xtls-rprx-vision"):
+            raise ValueError("unsupported_flow")
+        if get("flow"):
+            user["flow"] = get("flow")
+        stream = {"network": "tcp", "security": "reality", "realitySettings": {
+            "serverName": get("sni"), "fingerprint": get("fp") or "firefox",
+            "publicKey": key, "shortId": sid}}
+        label = "tcp_reality"
+    else:
+        raise ValueError("unsupported_transport")
+    out = {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{
+        "address": u.hostname, "port": u.port, "users": [user]}]}, "streamSettings": stream}
+    if sum(o.get("tag") == "proxy" for o in cfg.get("outbounds", [])) != 1:
+        raise ValueError("expected_one_proxy_outbound")
+    cfg = dict(cfg)
+    cfg["outbounds"] = [out if o.get("tag") == "proxy" else o for o in cfg["outbounds"]]
+    return cfg, label
 
-def eligible(l):
-    q = l["q"]
-    return q.get("type") == "xhttp" and q.get("security") == "tls" and q.get("sni")
 
-cands = [l for l in links if eligible(l)]
-if not cands:
-    print("NO_XHTTP_LINKS"); sys.exit(2)
-
-t = links[want - 1] if want else cands[0]
-if want and not eligible(t):
-    print("SKIP:" + t["name"]); sys.exit(2)
-q = t["q"]
-
-tls = {"serverName": q["sni"], "fingerprint": q.get("fp", "firefox")}
-if q.get("alpn"):
-    tls["alpn"] = [a for a in q["alpn"].split(",") if a]
-
-xs = {"path": q.get("path", "/"), "mode": q.get("mode", "auto")}
-if q.get("host"):
-    xs["host"] = q["host"]
-if q.get("extra") and not drop_extra:
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("cache")
+    p.add_argument("output")
+    p.add_argument("index", nargs="?", type=int, default=0)
+    p.add_argument("--base", default="/usr/local/etc/xray/config.json")
+    p.add_argument("--no-extra", action="store_true")
+    a = p.parse_args()
     try:
-        xs["extra"] = json.loads(q["extra"])
+        cfg = json.loads(Path(a.base).read_text())
+        lines = [s.strip() for s in Path(a.cache).read_text().splitlines() if s.strip().startswith("vless://")]
+        if a.index < 0 or a.index > len(lines):
+            raise ValueError("index_out_of_range")
+        candidates = [(a.index, lines[a.index - 1])] if a.index else list(enumerate(lines, 1))
+        for index, line in candidates:
+            try:
+                result, label = build(line, cfg, a.no_extra)
+            except (ValueError, KeyError, TypeError) as exc:
+                reason = str(exc) if str(exc) in {"missing_endpoint", "missing_sni", "invalid_extra", "invalid_public_key", "invalid_short_id", "unsupported_flow", "unsupported_transport", "expected_one_proxy_outbound"} else "invalid_parameters"
+                if a.index:
+                    print("SKIP:entry_%d_%s" % (index, reason))
+                    return 2
+                continue
+            Path(a.output).write_text(json.dumps(result, indent=2) + "\n")
+            print("BUILT:entry_%d_%s" % (index, label))
+            return 0
+        print("SKIP:no_supported_candidates")
+        return 2
     except Exception:
-        pass
+        print("ERROR:configuration_or_input_invalid")
+        return 2
 
-cfg = {
-  "log": {"loglevel": "warning"},
-  "inbounds": [
-    {"tag": "socks-in", "listen": "172.19.0.1", "port": 1080,
-     "protocol": "socks", "settings": {"udp": False}},
-    {"tag": "http-in", "listen": "172.19.0.1", "port": 1081,
-     "protocol": "http"}
-  ],
-  "outbounds": [
-    {"tag": "direct", "protocol": "freedom"},
-    {"tag": "proxy", "protocol": "vless",
-     "settings": {"vnext": [{"address": t["server"], "port": t["port"],
-                  "users": [{"id": t["uuid"], "encryption": "none"}]}]},
-     "streamSettings": {"network": "xhttp", "security": "tls",
-                        "tlsSettings": tls, "xhttpSettings": xs}}
-  ],
-  "routing": {"domainStrategy": "AsIs", "rules": [
-    {"type": "field", "domain": ["domain:openrouter.ai", "domain:claude.ai", "domain:anthropic.com"], "outboundTag": "proxy"},
-    {"type": "field", "domain": ["domain:telegram.org", "domain:t.me", "domain:telesco.pe"], "outboundTag": "proxy"},
-    {"type": "field", "domain": ["domain:ithyper.ru"], "outboundTag": "proxy"},
-    {"type": "field", "domain": ["domain:openai.com", "domain:chatgpt.com", "domain:oaistatic.com", "domain:oaiusercontent.com", "domain:oaistatsig.com"], "outboundTag": "proxy"}
-  ]}
-}
-json.dump(cfg, open(out_path, "w"), indent=2)
-print("BUILT:" + t["server"] + " (" + t["name"] + ") extra=" + ("yes" if "extra" in xs else "no"))
+
+if __name__ == "__main__":
+    sys.exit(main())
