@@ -1,21 +1,32 @@
 #!/bin/bash
-# v3.1 — retry-цикл на случай общего флапа ithyper (08.11.2026: все 4 ноды лежали ~20 мин)
-source /opt/vless-updater/env
+# v3.2 — XHTTP/TLS + TCP/REALITY; safe apply and process-wide lock.
+umask 077
+command -v flock >/dev/null || { echo '[vless-updater] flock missing'; exit 1; }
+exec 9>/run/lock/vless-updater.lock || exit 1
+flock -n 9 || { echo '[vless-updater] another run holds lock'; exit 0; }
+source /opt/vless-updater/env || exit 1
+APPLIER=/opt/vless-updater/apply_candidate.sh
+[ -f "$APPLIER" ] || { echo '[vless-updater] missing apply helper'; exit 1; }
 
 CACHE=/opt/vless-updater/nodes_cache.txt
 ALERT_TS=/opt/vless-updater/.alert_ts
 STATE=/opt/vless-updater/.state
 ALERT_COOLDOWN=14400
 XCONFIG=${XCONFIG:-/usr/local/etc/xray/config.json}
+export XCONFIG PROXY
 BUILDER=/opt/vless-updater/build_xray_config.py
 ATTEMPTS=${ATTEMPTS:-4}
 RETRY_DELAY=${RETRY_DELAY:-180}
+[[ "$ATTEMPTS" =~ ^[1-9][0-9]*$ && "$RETRY_DELAY" =~ ^[0-9]+$ ]] || exit 1
+TMPDIR_RUN=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$TMPDIR_RUN"' EXIT
+trap 'exit 1' TERM INT HUP
 
 log() { echo "[vless-updater] $1"; }
 
 notify() {
   [ -z "$TG_TOKEN" ] && return
-  log "alert send: ${1:0:60}"
+  log "alert send attempted"
   curl -s --max-time 20 -x "$PROXY" \
     "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
     -d "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" >/dev/null 2>&1 \
@@ -39,21 +50,21 @@ state() { cat "$STATE" 2>/dev/null || echo ok; }
 mark()  { echo "$1" > "$STATE"; }
 
 health() {
-  curl -s --max-time 15 -x "$PROXY" https://openrouter.ai/api/v1/models \
+  curl -s --max-time 15 --noproxy "" -x "$PROXY" https://openrouter.ai/api/v1/models \
     -o /dev/null -w "%{http_code}" 2>/dev/null
 }
 
 fetch_nodes() {
-  local raw; raw=$(mktemp)
+  local raw; raw=$(mktemp "$TMPDIR_RUN/raw.XXXXXX") || return 1
   local mode
   for mode in proxy direct; do
     if [ "$mode" = proxy ]; then
-      curl -sL --max-time 30 -x "$PROXY" "$SUB_URL" -o "$raw" 2>/dev/null
+      curl -fsSL --max-time 30 --noproxy "" -x "$PROXY" "$SUB_URL" -o "$raw" 2>/dev/null
     else
       log "fetch: retrying direct"
-      curl -sL --max-time 30 "$SUB_URL" -o "$raw" 2>/dev/null
+      curl -fsSL --max-time 30 --noproxy "*" "$SUB_URL" -o "$raw" 2>/dev/null
     fi
-    if [ -s "$raw" ] && base64 -di "$raw" 2>/dev/null | grep -q "^vless://"; then
+    if [ "$?" = 0 ] && [ -s "$raw" ] && base64 -di "$raw" 2>/dev/null | grep -q "^vless://"; then
       base64 -di "$raw" > "$1" 2>/dev/null
       rm -f "$raw"
       log "fetch: OK via $mode"
@@ -65,8 +76,7 @@ fetch_nodes() {
 }
 
 recovered() {
-  cur=$(grep -oP '(?<="address": ")[^"]+' "$XCONFIG" | head -1)
-  notify "✅ VPN VPS: прокси восстановлен (нода $cur), OpenRouter 200"
+  notify "✅ VPN VPS: прокси восстановлен, OpenRouter 200"
   mark ok
 }
 
@@ -93,7 +103,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
     fi
   fi
 
-  tmpfile=$(mktemp)
+  tmpfile=$(mktemp "$TMPDIR_RUN/nodes.XXXXXX") || exit 1
   if fetch_nodes "$tmpfile"; then
     cp "$tmpfile" "$CACHE"
     log "attempt $attempt: nodes: $(grep -c '^vless://' "$tmpfile") from subscription"
@@ -111,27 +121,24 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   i=0
   while [ $i -lt "$n" ]; do
     i=$((i+1))
-    onecfg=$(mktemp --suffix=.json)
-    res=$(python3 "$BUILDER" "$tmpfile" "$onecfg" "$i" 2>&1)
+    onecfg=$(mktemp "$TMPDIR_RUN/candidate.XXXXXX.json") || exit 1
+    res=$(python3 "$BUILDER" "$tmpfile" "$onecfg" "$i" --base "$XCONFIG" 2>&1)
     rc=$?
     if [ $rc -ne 0 ]; then
       log "attempt $attempt node $i: skip ($res)"
       rm -f "$onecfg"
       continue
     fi
-    if ! xray run -test -c "$onecfg" >/dev/null 2>&1; then
-      log "attempt $attempt node $i: xray -test failed"
-      rm -f "$onecfg"
-      continue
-    fi
-    cp "$onecfg" "$XCONFIG"
+    bash "$APPLIER" "$onecfg"
+    rc=$?
     rm -f "$onecfg"
-    systemctl restart xray
-    sleep 3
-    c1=$(health); [ "$c1" = "200" ] || { sleep 5; c1=$(health); }
-    disp="${res#BUILT:}"; disp="${disp% extra=yes}"
-    log "attempt $attempt node $i: $disp health $c1"
-    if [ "$c1" = "200" ]; then fixed="$disp"; break; fi
+    if [ "$rc" = 2 ]; then
+      log "ERROR: unsafe apply/rollback failure; stopping"
+      mark fail
+      exit 1
+    fi
+    log "attempt $attempt node $i: apply status $rc"
+    if [ "$rc" = 0 ]; then fixed="${res#BUILT:}"; break; fi
   done
   rm -f "$tmpfile"
   [ -n "$fixed" ] && break
@@ -146,7 +153,7 @@ fi
 
 log "ERROR: все кандидаты мертвы после $ATTEMPTS попыток"
 if [ "$(state)" != "fail" ]; then
-  notify "❌ VPN VPS: все ноды недоступны ($ATTEMPTS попытки за ~$(( (ATTEMPTS-1)*RETRY_DELAY/60 + 10 )) мин) — похоже на общий сбой ithyper. Повтор через час по таймеру."
+  notify "❌ VPN VPS: все ноды недоступны ($ATTEMPTS попытки) — поддерживаемые кандидаты не прошли проверку. Следующая попытка по таймеру."
 fi
 mark fail
 exit 1
